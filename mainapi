@@ -1,0 +1,394 @@
+#!/usr/bin/env python3
+"""
+Main API - Server Pool & Distributor
+OPTIMIZED FOR 10K+ SERVERS/MINUTE
+CACHE NEVER CLEARS - RECYCLES VISITED SERVERS WHEN EMPTY
+"""
+from flask import Flask, jsonify, request
+import threading
+import time
+from collections import deque
+import logging
+import os
+
+app = Flask(__name__)
+
+# ============ CONFIG ============
+CACHE_LIMIT = int(os.getenv("CACHE_LIMIT", 50000))  # 50K cache
+# CACHE_ENTRY_TTL removed - cache never expires now
+# CACHE_CLEAR_INTERVAL removed - cache never clears now
+
+# ============ STATE ============
+server_cache = deque()        # (job_id, timestamp)
+cache_set = set()             # O(1) lookup
+jobs_assigned = 0
+total_received = 0
+
+# Visit tracking - servers that have been assigned at least once
+visited_servers = {}  # {job_id: {"count": N, "last_assigned": timestamp, "found_items": bool}}
+visited_queue = deque()  # Queue of previously visited servers for recycling
+visit_stats = {"total_visits": 0, "unique_servers": 0, "repeat_visits": 0, "recycled": 0}
+
+lock = threading.Lock()
+
+# ============ LOGGING ============
+logging.basicConfig(
+    level=logging.INFO,
+    format='[MAIN-API] %(asctime)s %(levelname)s: %(message)s',
+    datefmt='%H:%M:%S'
+)
+
+# ============ UTILS ============
+def _now():
+    return time.time()
+
+def add_to_cache(new_servers):
+    now = _now()
+    added = 0
+    duplicates = 0
+    
+    for job_id in new_servers:
+        if not job_id:
+            continue
+        
+        if job_id in cache_set:
+            duplicates += 1
+            continue
+        
+        server_cache.append((job_id, now))
+        cache_set.add(job_id)
+        added += 1
+    
+    removed = 0
+    while len(server_cache) > CACHE_LIMIT:
+        jid, _ = server_cache.popleft()
+        cache_set.discard(jid)
+        removed += 1
+    
+    if removed > 0:
+        logging.warning(f"⚠️ Cache full: removed {removed} oldest servers")
+    
+    return added, duplicates
+
+def recycle_visited_servers():
+    """Move visited servers back to the visited queue for recycling"""
+    now = _now()
+    recycled = 0
+    
+    # Get all visited servers sorted by last assignment (oldest first)
+    servers_by_age = sorted(
+        [(jid, data["last_assigned"]) for jid, data in visited_servers.items()],
+        key=lambda x: x[1]
+    )
+    
+    # Add them to the visited queue
+    for jid, _ in servers_by_age:
+        if jid not in cache_set:  # Don't add if already in main cache
+            visited_queue.append(jid)
+            recycled += 1
+    
+    return recycled
+
+# ============ ENDPOINTS ============
+@app.route("/", methods=["GET"])
+@app.route("/status", methods=["GET"])
+def status():
+    with lock:
+        repeat_rate = 0
+        if visit_stats["total_visits"] > 0:
+            repeat_rate = (visit_stats["repeat_visits"] / visit_stats["total_visits"]) * 100
+        
+        return jsonify({
+            "cache_jobs": len(server_cache),
+            "jobs_assigned": jobs_assigned,
+            "total_received": total_received,
+            "cache_limit": CACHE_LIMIT,
+            "visited_pool_size": len(visited_servers),
+            "visited_queue_size": len(visited_queue),
+            "health": "healthy" if len(server_cache) > 1000 else ("recycling" if len(visited_queue) > 0 else "low"),
+            "cache_permanent": True,
+            "visit_tracking": {
+                "total_visits": visit_stats["total_visits"],
+                "unique_servers": visit_stats["unique_servers"],
+                "repeat_rate": f"{repeat_rate:.1f}%",
+                "recycled": visit_stats["recycled"]
+            }
+        })
+
+@app.route("/get-server", methods=["GET"])
+def get_server():
+    global jobs_assigned
+    
+    with lock:
+        job_id = None
+        from_recycle = False
+        
+        # Try to get from main cache first
+        if server_cache:
+            job_id, _ = server_cache.popleft()
+            cache_set.discard(job_id)
+        # If main cache empty, try visited queue
+        elif visited_queue:
+            job_id = visited_queue.popleft()
+            from_recycle = True
+            visit_stats["recycled"] += 1
+        # If visited queue empty too, recycle all visited servers
+        elif visited_servers:
+            recycled = recycle_visited_servers()
+            logging.info(f"♻️ Cache empty! Recycled {recycled} visited servers")
+            if visited_queue:
+                job_id = visited_queue.popleft()
+                from_recycle = True
+                visit_stats["recycled"] += 1
+        
+        if not job_id:
+            return jsonify({"error": "No servers available"}), 404
+        
+        jobs_assigned += 1
+        
+        # Track this assignment
+        now = _now()
+        if job_id in visited_servers:
+            visited_servers[job_id]["count"] += 1
+            visited_servers[job_id]["last_assigned"] = now
+        else:
+            visited_servers[job_id] = {
+                "count": 1,
+                "last_assigned": now,
+                "found_items": False
+            }
+        
+        return jsonify({
+            "job_id": job_id,
+            "remaining": len(server_cache),
+            "from_recycle": from_recycle,
+            "visited_queue": len(visited_queue)
+        })
+
+@app.route("/get-servers", methods=["GET"])
+def get_servers():
+    with lock:
+        return jsonify({
+            "job_ids": [jid for jid, _ in server_cache],
+            "total": len(server_cache)
+        })
+
+@app.route("/get-batch", methods=["GET"])
+def get_batch():
+    global jobs_assigned
+    
+    count = min(int(request.args.get("count", 10)), 500)  # Max 500
+    
+    with lock:
+        batch = []
+        from_recycle_count = 0
+        
+        # Try to fill from main cache
+        while len(batch) < count and server_cache:
+            job_id, _ = server_cache.popleft()
+            cache_set.discard(job_id)
+            batch.append({"job_id": job_id, "from_recycle": False})
+        
+        # Fill remaining from visited queue
+        while len(batch) < count and visited_queue:
+            job_id = visited_queue.popleft()
+            batch.append({"job_id": job_id, "from_recycle": True})
+            from_recycle_count += 1
+            visit_stats["recycled"] += 1
+        
+        # If still need more and visited queue empty, recycle all visited
+        if len(batch) < count and not visited_queue and visited_servers:
+            recycled = recycle_visited_servers()
+            logging.info(f"♻️ Cache empty during batch! Recycled {recycled} visited servers")
+            
+            while len(batch) < count and visited_queue:
+                job_id = visited_queue.popleft()
+                batch.append({"job_id": job_id, "from_recycle": True})
+                from_recycle_count += 1
+                visit_stats["recycled"] += 1
+        
+        if not batch:
+            return jsonify({"error": "No servers available", "servers": []}), 404
+        
+        # Track assignments
+        now = _now()
+        for item in batch:
+            job_id = item["job_id"]
+            if job_id in visited_servers:
+                visited_servers[job_id]["count"] += 1
+                visited_servers[job_id]["last_assigned"] = now
+            else:
+                visited_servers[job_id] = {
+                    "count": 1,
+                    "last_assigned": now,
+                    "found_items": False
+                }
+        
+        jobs_assigned += len(batch)
+        
+        return jsonify({
+            "servers": batch,
+            "count": len(batch),
+            "remaining": len(server_cache),
+            "from_recycle": from_recycle_count
+        })
+
+@app.route("/jobs-assigned", methods=["GET"])
+def jobs_assigned_endpoint():
+    return jsonify({
+        "jobs_assigned": jobs_assigned,
+        "total_received": total_received
+    })
+
+@app.route("/add-pool", methods=["POST"])
+def add_pool():
+    global total_received
+    
+    data = request.get_json()
+    if not data or "servers" not in data:
+        return jsonify({"error": "Missing 'servers' field"}), 400
+    
+    servers = data["servers"]
+    if not isinstance(servers, list):
+        return jsonify({"error": "'servers' must be a list"}), 400
+    
+    with lock:
+        added, duplicates = add_to_cache([str(s) for s in servers if s])
+        total = len(server_cache)
+        total_received += len(servers)
+    
+    if added > 0 and total % 1000 < added:
+        logging.info(
+            f"📦 Pool update: received={len(servers)}, "
+            f"added={added}, duplicates={duplicates}, "
+            f"cache_total={total:,}"
+        )
+    
+    return jsonify({
+        "added": added,
+        "duplicates": duplicates,
+        "cache_total": total
+    })
+
+@app.route("/report-visit", methods=["POST"])
+def report_visit():
+    data = request.get_json()
+    if not data or "jobId" not in data:
+        return jsonify({"error": "Missing jobId"}), 400
+    
+    job_id = str(data["jobId"])
+    found_items = data.get("found_items", False)
+    
+    with lock:
+        visit_stats["total_visits"] += 1
+        
+        if job_id in visited_servers:
+            visited_servers[job_id]["found_items"] = visited_servers[job_id]["found_items"] or found_items
+            visit_stats["repeat_visits"] += 1
+        else:
+            visited_servers[job_id] = {
+                "count": 1,
+                "last_assigned": _now(),
+                "found_items": found_items
+            }
+            visit_stats["unique_servers"] += 1
+    
+    return jsonify({"status": "recorded"})
+
+@app.route("/visit-stats", methods=["GET"])
+def get_visit_stats():
+    with lock:
+        repeat_rate = (visit_stats["repeat_visits"] / visit_stats["total_visits"]) * 100 if visit_stats["total_visits"] > 0 else 0
+        
+        top_repeated = sorted(
+            [(jid, data["count"]) for jid, data in visited_servers.items()],
+            key=lambda x: x[1],
+            reverse=True
+        )[:10]
+        
+        return jsonify({
+            "summary": {
+                "total_visits": visit_stats["total_visits"],
+                "unique_servers": visit_stats["unique_servers"],
+                "repeat_visits": visit_stats["repeat_visits"],
+                "repeat_rate": f"{repeat_rate:.1f}%",
+                "recycled": visit_stats["recycled"]
+            },
+            "top_repeated_servers": [
+                {"job_id": jid[:20] + "...", "visits": count}
+                for jid, count in top_repeated
+            ],
+            "active_tracking": len(visited_servers),
+            "visited_queue_size": len(visited_queue)
+        })
+
+@app.route("/clear-cache", methods=["POST"])
+def clear_cache():
+    with lock:
+        server_cache.clear()
+        cache_set.clear()
+        logging.warning("🗑️ Cache cleared completely (manual request)")
+    
+    return jsonify({"message": "Cache cleared"})
+
+@app.route("/health", methods=["GET"])
+def health():
+    with lock:
+        cache_size = len(server_cache)
+        has_recycle = len(visited_queue) > 0 or len(visited_servers) > 0
+    
+    if cache_size < 500 and not has_recycle:
+        status = "critical"
+    elif cache_size < 2000 and not has_recycle:
+        status = "warning"
+    elif cache_size < 500:
+        status = "recycling"
+    else:
+        status = "healthy"
+    
+    return jsonify({
+        "status": status,
+        "cache_size": cache_size,
+        "visited_pool": len(visited_servers),
+        "visited_queue": len(visited_queue),
+        "uptime": int(time.time() - start_time)
+    }), 200 if status in ["healthy", "recycling"] else 503
+
+# ============ BACKGROUND THREADS ============
+# REMOVED: periodic_cleanup - no expiration anymore
+# REMOVED: cache_clear_150s - cache never clears
+
+def stats_logger():
+    while True:
+        time.sleep(60)
+        with lock:
+            elapsed = time.time() - start_time
+            rate = jobs_assigned / elapsed if elapsed > 0 else 0
+            logging.info(
+                f"📊 STATS → Cache: {len(server_cache):,}, "
+                f"Visited: {len(visited_servers):,}, "
+                f"Recycle Queue: {len(visited_queue):,}, "
+                f"Assigned: {jobs_assigned:,}, "
+                f"Received: {total_received:,}, "
+                f"Recycled: {visit_stats['recycled']:,}, "
+                f"Rate: {rate:.1f} jobs/sec"
+            )
+
+threading.Thread(target=stats_logger, daemon=True).start()
+
+# ============ MAIN ============
+start_time = time.time()
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 8000))
+    logging.info("=" * 60)
+    logging.info("🚀 MAIN API - OPTIMIZED FOR 10K+/MIN")
+    logging.info("⚠️ CACHE NEVER CLEARS - RECYCLES VISITED SERVERS")
+    logging.info("=" * 60)
+    logging.info(f"Cache limit: {CACHE_LIMIT:,} servers")
+    logging.info(f"Cache TTL: PERMANENT (never expires)")
+    logging.info(f"Cache clear: DISABLED (never clears)")
+    logging.info(f"Recycling: ENABLED (reuses visited servers when cache empty)")
+    logging.info(f"Port: {port}")
+    logging.info("=" * 60)
+    app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
